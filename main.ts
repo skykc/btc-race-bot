@@ -9,8 +9,14 @@
 //   - RSI(60): the simple mean of gains and losses over the last 60
 //     one-minute closes (a plain 60-bar average, NOT Wilder's smoothing
 //     and NOT the 14-bar RSI of the kit's rsi-bollinger baseline).
-//   - Enter long with all cash when RSI(60) falls below 35: the market
-//     has sold off hard over the last hour and is stretched.
+//   - Enter long with all cash when RSI(60) falls below 35 AND the
+//     close is at least 50 bps below the close 60 bars ago: the
+//     washout must be real, not an RSI that merely sagged on a flat
+//     tape. RSI alone can drift under 35 while the price barely
+//     moved (small down-drifts accumulate in the gain/loss mix),
+//     and buying those flat-tape dips pays the ~26 bps round trip
+//     for a bounce that never comes. The 50 bps washout gate only
+//     admits dips where the hour actually sold off.
 //   - Exit the whole position when RSI(60) rises above 65 (the bounce
 //     has run its course) or when the close falls 150 bps below the
 //     highest close since entry (a trailing stop that doubles as a
@@ -39,19 +45,38 @@ const RSI_EXIT_ABOVE = 65;
 const RSI_REARM_ABOVE = 50;
 /** Trailing stop / stop-loss in basis points below the peak close since entry. */
 const TRAIL_BPS = 150;
+/** Entry also requires the close to be this far below the close 60 bars ago. */
+const WASHOUT_BPS = 50;
 const MAX_SLIPPAGE_BPS = 100;
 
 /** Rolling window of the last RSI_BARS one-minute close-to-close changes. */
 const changes: number[] = [];
 let lastClose: number | null = null;
+/** Rolling window of the last RSI_BARS + 1 closes, so closes[0] is 60 bars back. */
+const closes: number[] = [];
 
 function pushBar(bar: Bar): void {
   const c = Number(bar.c);
+  closes.push(c);
+  if (closes.length > RSI_BARS + 1) closes.shift();
   if (lastClose !== null) {
     changes.push(c - lastClose);
     if (changes.length > RSI_BARS) changes.shift();
   }
   lastClose = c;
+}
+
+/**
+ * How far the current close sits below the close RSI_BARS bars ago,
+ * in basis points; null until the window is full. Positive means the
+ * hour genuinely sold off.
+ */
+function washoutBps(): number | null {
+  if (closes.length < RSI_BARS + 1) return null;
+  const then = closes[0];
+  const now = closes[closes.length - 1];
+  if (then <= 0) return null;
+  return ((then - now) / then) * 10000;
 }
 
 /** RSI over the last RSI_BARS changes, simple means; null until the window is full. */
@@ -116,6 +141,8 @@ await runBars({
     }
 
     if (!holding && armed && r < RSI_ENTER_BELOW) {
+      const w = washoutBps();
+      if (w === null || w < WASHOUT_BPS) return orders;
       const cash = state.cash;
       if (cash >= BigInt(state.hello.fees.min_notional_quote_units)) {
         orders.push({ side: 'buy', symbol: SYMBOL, notional_quote_units: cash, max_slippage_bps: MAX_SLIPPAGE_BPS });
